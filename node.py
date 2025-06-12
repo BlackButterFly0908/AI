@@ -1,5 +1,7 @@
-from utils  import Node ,call_llm ,Flow, BatchFlow, AsyncNode, AsyncBatchNode, AsyncParallelBatchNode, AsyncFlow, AsyncBatchFlow, AsyncParallelBatchFlow
-import datetime ,json
+from utils  import Node ,call_llm ,Flow
+from tools import analyze_results , SearchTool , WebSearchTool
+import datetime ,json ,yaml
+from typing import List, Dict
 
 # Planner_Prep is a Node that prepares a research plan based on user input.
 # It generates a detailed plan for information gathering tasks using a team of specialized agents.
@@ -162,6 +164,7 @@ class Planner_Prep(Node):
             json_str = response.split("{", 1)[1].rsplit("}", 1)[0]
             json_str = "{" + json_str + "}"
             plan = json.loads(json_str)
+           
             return plan
         except Exception as e:
             print(f"Error parsing LLM response for plan generation: {e}")
@@ -173,9 +176,10 @@ class Planner_Prep(Node):
         # Post-processing can be added here if needed
         shared["plan"] = exec_res
         print(exec_res)
+        yaml_output = yaml.dump( exec_res, sort_keys=False, allow_unicode=True)
+        print(yaml_output + '\n')
         return shared["webtype"]
     
-
 #this class node here  will search the web for the plan using tavily and the search information was from shared[plan][discription]
 class TavilySearch(Node):
     def prep(self, shared):
@@ -194,10 +198,135 @@ class TavilySearch(Node):
         return steps
 
 
+class SearchNode(Node):
+    """Node to perform web search using SerpAPI"""
+    
+    def prep(self, shared):
+       return shared.get("plan", {})
+        
+    def exec(self,shared):
+        steps = shared.get("steps", [])
+       
+        num_results = 10
+        searcher = WebSearchTool()
+        if not  steps:
+            return []
+        for step in steps:
+            if step.get("need_search"):
+                shared["track_activity"]=step['description']
+                return searcher.search(step['description'], num_results)              
+        #return searcher.search(query, num_results)
+        
+    def post(self, shared, prep_res, exec_res):
+        shared["search_results"] = exec_res
+        steps = shared.get("plan", {}).get("steps", [])
+        print(shared["search_results"])
+        for item in steps:
+            if not item.get("need_search"):
+                return "VerifySearchNode"
+        return "default"
+    
+class VerifySearchNode(Node):
+    """Node to verify search results"""
+    
+    def prep(self, shared):
+        return shared.get("search_results", []),shared.get("track_activity", "No description provided")
+        
+    def exec(self, shared):
+        search_results,description = shared
+        if not search_results:
+            return "No search results to verify"
+        prompt = f"""
+            You are a research assistant your only job is to verify the relevance of the search results.
+
+            #You are given:
+            - A step description: \"\"\"{description}\"\"\"
+            - A list of search results, each with a 'snippet' and a 'url' (passed separately).
+
+            #Your task:
+            - For each search result, check if it is strongly relevant to the description.
+            - Keep ONLY the results that are clearly relevant.
+            - Disregard any result that is not relevant.
+            - Return the filtered results in the SAME JSON structure, but only include relevant results.
+            - Each result you include must have both its 'snippet' and its associated 'url'.
+
+         
+            Output in YAML format , with no irrelevant results, and no extra commentary:
+            ```yaml
+            filtered_results:
+                    - snippet: <string>
+                    - url: <string>
+                   
+            ```
+            #Search Results:
+            {search_results}
+            """
+        
+        try:
+            response = call_llm(prompt)
+            # Extract YAML between code fences
+            yaml_str = response.split("```yaml")[1].split("```")[0].strip()
+            
+            import yaml
+            filtered_results = yaml.safe_load(yaml_str)
+            return filtered_results
+            
+        except Exception as e:
+            print(f"Error analyzing results: {str(e)}")
+            return {
+                "summary": "Error analyzing results",
+                "key_points": [],
+                "follow_up_queries": []
+            }
+        # Here you would implement the logic to verify the search results
+        # For demonstration, we will just return the results as is
+  
+        
+    def post(self, shared, prep_res, exec_res):
+        print("\nVerified Search Results:")
+        shared["verified_results"] = exec_res
+        print(shared["verified_results"])
+        return "search_node"
 
 
+class AnalyzeResultsNode(Node):
+    """Node to analyze search results using LLM"""
+    
+    def prep(self, shared):
+        
+        return shared.get("user_query", ""), shared.get("search_results", [])
+        
+    def exec(self, shared):
+        query, results = shared
+        if not results:
+            return {
+                "summary": "No search results to analyze",
+                "key_points": [],
+                "follow_up_queries": []
+            }
+            
+        return analyze_results(query, results)
+        
+    def post(self, shared, prep_res, exec_res):
+        shared["analysis"] = exec_res
+        
+        # Print analysis
+        print("\nSearch Analysis:")
+        print("\nSummary:", exec_res["summary"])
+        
+        print("\nKey Points:")
+        for point in exec_res["key_points"]:
+            print(f"- {point}")
+            
+        print("\nSuggested Follow-up Queries:")
+        for query in exec_res["follow_up_queries"]:
+            print(f"- {query}")
+            
+        return "default"
 
 
+    
+  
 if __name__ == "__main__":
     # Example usage
     user_query = "what is a bitcoin?"
@@ -205,7 +334,10 @@ if __name__ == "__main__":
     locale = "en"
     web_type = "tavily"  # Example web type, can be changed as needed
     planner = Planner_Prep()
+    search = SearchNode()
+    analyze = AnalyzeResultsNode()
     websearcher = TavilySearch()
+    verifySearch = VerifySearchNode()
     shared_data = {
         "user_query": user_query,
         "max_step_num": max_step_num,
@@ -214,9 +346,10 @@ if __name__ == "__main__":
     }
     
 
-    planner - 'tavily'>> websearcher
+    planner - 'tavily'>> search
+    search - 'VerifySearchNode' >> verifySearch
+    verifySearch - 'search_node' >> search
     # plan = planner.run(shared_data)
     # print(json.dumps(plan, indent=2))
     flow = Flow(start=planner)
     flow.run(shared_data)
-
